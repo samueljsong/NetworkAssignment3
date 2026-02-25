@@ -30,7 +30,17 @@ class PasslibVerifier:
     full_hash: str
 
     def verify(self, candidate: str) -> bool:
-        return self.ctx.verify(candidate, self.full_hash)
+        try:
+            candidate_bytes = candidate.encode("utf-8")
+
+            # bcrypt hard limit
+            if len(candidate_bytes) > 72:
+                return False
+
+            return self.ctx.verify(candidate, self.full_hash)
+
+        except Exception:
+            return False
 
 
 @dataclass
