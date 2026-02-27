@@ -15,6 +15,7 @@ from common import (
     Job,
     ChunkAssign,
     ChunkDone,
+    WorkerDone,
     PROTOCOL_VERSION,
     ProtocolError,
     heartbeat_resp_dict,
@@ -132,6 +133,11 @@ class WorkerApp:
             rx_thread = threading.Thread(target=self._rx_loop, args=(sock,), daemon=True)
             rx_thread.start()
 
+            # Starts the timer for worker and count for chunks completed
+            worker_start = time.perf_counter()
+            chunks_completed = 0
+            sent_worker_done = False
+
             while not self._stop_event.is_set():
                 # Ask for a chunk (pull model)
                 self._safe_send(sock, work_request_dict(self.worker_id))
@@ -148,8 +154,21 @@ class WorkerApp:
                     time.sleep(0.5)
                     continue
 
-                if mtype == "NO_MORE_WORK":
+                if mtype == "NO_MORE_WORK" and not sent_worker_done:
+                    # change the sent_worker_done flag
+                    sent_worker_done = True
                     # nothing left; exit cleanly
+                    worker_runtime = time.perf_counter() - worker_start
+                    # send worker stats to controller
+                    worker_done = WorkerDone(
+                            worker_id=self.worker_id,
+                            runtime_sec=worker_runtime,
+                            chunks_completed=chunks_completed,
+                            total_tested=self._total_tested_global,
+                            found=False
+                    )
+                    self._safe_send(sock, worker_done.to_dict())
+
                     return 0
 
                 if mtype == "CHUNK_ASSIGN":
@@ -180,27 +199,59 @@ class WorkerApp:
                     self._total_tested_global += tested
 
                     # Report chunk completion (recommended in the spec)
-                    done = ChunkDone(
+                    chunk_done = ChunkDone(
                         chunk_id=assign.chunk_id,
                         tested=tested,
                         compute_time=compute_time,
                         found=crack_res.found,
                         password=crack_res.password,
                     )
-                    self._safe_send(sock, done.to_dict())
+                    self._safe_send(sock, chunk_done.to_dict())
+                    
+                    # Increment total chunks completed
+                    chunks_completed += 1
 
                     # Clear current bruteforcer reference
                     with self._bruteforcer_lock:
                         self._bruteforcer = None
                         self._current_chunk_id = None
 
-                    if crack_res.found:
+                    if crack_res.found and not sent_worker_done:
+                        # Set the sent_worker_done flag
+                        sent_worker_done = True
                         # Local winner. Controller will broadcast STOP to others.
+                        worker_runtime = time.perf_counter() - worker_start
+
+                        worker_done = WorkerDone(
+                            worker_id=self.worker_id,
+                            runtime_sec=worker_runtime,
+                            chunks_completed=chunks_completed,
+                            total_tested=self._total_tested_global,
+                            found=True
+                        )
+                        self._safe_send(sock, worker_done.to_dict())
+
                         self._stop_event.set()
                         return 0
 
                     # otherwise loop and request next chunk
                     continue
+
+            if not sent_worker_done:
+                sent_worker_done = True
+                worker_runtime = time.perf_counter() - worker_start
+                worker_done = WorkerDone(
+                    worker_id=self.worker_id,
+                    runtime_sec=worker_runtime,
+                    chunks_completed=chunks_completed,
+                    total_tested=self._total_tested_global,
+                    found=False,
+                    stopped=True,
+                )
+                try:
+                    self._safe_send(sock, worker_done.to_dict())
+                except Exception:
+                    pass
 
             return 0
 

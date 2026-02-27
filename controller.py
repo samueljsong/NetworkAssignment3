@@ -5,7 +5,7 @@ import argparse
 import selectors
 import socket
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 from common import (
@@ -14,6 +14,7 @@ from common import (
     Job,
     ChunkAssign,
     ChunkDone,
+    WorkerDone,
     Result,
     supported_charset_79,
     ProtocolError,
@@ -60,6 +61,7 @@ class ShadowParser:
 class Timings:
     parse_time: float = 0.0
     total_runtime: float = 0.0
+    worker_runtimes: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -281,6 +283,12 @@ class ControllerApp:
                             timings.total_runtime = time.perf_counter() - t0
                             self._report(entry, timings, found=True, password=res.password, found_by=ws.worker_id)
                             return 0
+                        continue
+                    
+                    # Worker is done.
+                    if mtype == "WORKER_DONE":
+                        worker_done = WorkerDone.from_dict(msg)
+                        print(f"Worker:[{worker_done.worker_id}] total run time: [{worker_done.runtime_sec} Seconds]")
                         continue
 
                     # ignore unknown messages (robustness)
