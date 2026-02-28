@@ -271,6 +271,12 @@ class ControllerApp:
 
                         # otherwise just acknowledge internally (no need to respond)
                         continue
+                    
+                    # Worker is done.
+                    if mtype == "WORKER_DONE":
+                        worker_done = WorkerDone.from_dict(msg)
+                        print(f"Worker:[{worker_done.worker_id}] total run time: [{worker_done.runtime_sec} Seconds]")
+                        continue
 
                     # Worker may still send RESULT for compatibility; treat as terminal.
                     if mtype == "RESULT":
@@ -283,12 +289,6 @@ class ControllerApp:
                             timings.total_runtime = time.perf_counter() - t0
                             self._report(entry, timings, found=True, password=res.password, found_by=ws.worker_id)
                             return 0
-                        continue
-                    
-                    # Worker is done.
-                    if mtype == "WORKER_DONE":
-                        worker_done = WorkerDone.from_dict(msg)
-                        print(f"Worker:[{worker_done.worker_id}] total run time: [{worker_done.runtime_sec} Seconds]")
                         continue
 
                     # ignore unknown messages (robustness)
