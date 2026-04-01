@@ -67,6 +67,7 @@ class ShadowParser:
 class Timings:
     parse_time: float = 0.0
     total_runtime: float = 0.0
+    total_cracking_time: float = 0.0
     dispatch_overhead: float = 0.0
     checkpoint_overhead: float = 0.0
     assignments_issued: int = 0
@@ -226,6 +227,7 @@ class ControllerApp:
         print(f"Dispatch overhead:  {timings.dispatch_overhead:.6f}")
         print(f"Checkpoint overhead: {timings.checkpoint_overhead:.6f}")
         print(f"Total runtime:      {timings.total_runtime:.6f}")
+        print(f"Total cracking time: {timings.total_cracking_time:.6f}")
         print(f"Assignments issued: {timings.assignments_issued}")
         print(f"Checkpoints recv:   {timings.checkpoints_received}")
         print(f"Heartbeats recv:    {timings.heartbeats_received}")
@@ -238,6 +240,7 @@ class ControllerApp:
     def run(self) -> int:
         t0 = time.perf_counter()
         timings = Timings()
+        cracking_start_time: Optional[float] = None
 
         t_parse0 = time.perf_counter()
         self._entry = ShadowParser.parse_shadow_file(self.shadow_file, self.username)
@@ -311,6 +314,9 @@ class ControllerApp:
                         ws.worker_id = reg.worker_id
                         ws.threads = reg.threads
                         ws.registered = True
+
+                        if cracking_start_time is None:
+                            cracking_start_time = time.perf_counter()
 
                         t_dispatch0 = time.perf_counter()
                         job = JobMessage(
@@ -412,7 +418,11 @@ class ControllerApp:
                             self._found_by = ws.worker_id
                             print(f"PASSWORD FOUND by {ws.worker_id}: {done.password}")
                             self._broadcast(stop_dict("FOUND"))
-                            timings.total_runtime = time.perf_counter() - t0
+
+                            now_perf = time.perf_counter()
+                            timings.total_runtime = now_perf - t0
+                            timings.total_cracking_time = 0.0 if cracking_start_time is None else (now_perf - cracking_start_time)
+
                             self._report(
                                 self._entry,
                                 timings,
@@ -442,7 +452,11 @@ class ControllerApp:
                             self._found_by = ws.worker_id
                             print(f"PASSWORD FOUND: {res.password}")
                             self._broadcast(stop_dict("FOUND"))
-                            timings.total_runtime = time.perf_counter() - t0
+                            
+                            now_perf = time.perf_counter()
+                            timings.total_runtime = now_perf - t0
+                            timings.total_cracking_time = 0.0 if cracking_start_time is None else (now_perf - cracking_start_time)
+                            
                             self._report(
                                 self._entry,
                                 timings,
@@ -455,7 +469,10 @@ class ControllerApp:
 
         finally:
             if self._found_password is None and self._entry is not None:
-                timings.total_runtime = time.perf_counter() - t0
+                now_perf = time.perf_counter()
+                timings.total_runtime = now_perf - t0
+                timings.total_cracking_time = 0.0 if cracking_start_time is None else (now_perf - cracking_start_time)
+
                 self._report(
                     self._entry,
                     timings,
