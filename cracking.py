@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict
 import threading
 
 from hashing import HashVerifier
@@ -41,7 +41,7 @@ class ThreadedBruteForcer:
 
         self.verifier = verifier
         self.charset = charset
-        self.length = length
+        self.max_length = length
         self.threads = threads
         self.chunk_size = max(1, chunk_size)
 
@@ -68,6 +68,17 @@ class ThreadedBruteForcer:
         self._inflight_lock = threading.Lock()
         self._inflight: Dict[int, int] = {}
 
+        # Precompute cumulative search-space boundaries for lengths 1..max_length
+        # Example for base=79, max_length=3:
+        # length 1 => indices [0, 79)
+        # length 2 => indices [79, 79+79^2)
+        # length 3 => indices [79+79^2, 79+79^2+79^3)
+        self._length_offsets: List[int] = [0]
+        running = 0
+        for candidate_len in range(1, self.max_length + 1):
+            running += self.base ** candidate_len
+            self._length_offsets.append(running)
+
     def stop(self) -> None:
         self._internal_stop.set()
 
@@ -79,11 +90,24 @@ class ThreadedBruteForcer:
         return False
 
     def _index_to_candidate(self, idx: int) -> str:
-        chars: List[str] = [""] * self.length
-        for pos in range(self.length - 1, -1, -1):
-            idx, digit = divmod(idx, self.base)
-            chars[pos] = self.charset[digit]
-        return "".join(chars)
+        base = self.base
+
+        length = 1
+        count_for_length = base  # base^1
+
+        # Find which length bucket this index belongs to
+        while idx >= count_for_length:
+            idx -= count_for_length
+            length += 1
+            count_for_length = base ** length
+
+        # Convert remaining index into base-N string of that length
+        chars = []
+        for _ in range(length):
+            idx, digit = divmod(idx, base)
+            chars.append(self.charset[digit])
+
+        return "".join(reversed(chars))
 
     def _claim_chunk(self) -> Optional[range]:
         with self._index_lock:
