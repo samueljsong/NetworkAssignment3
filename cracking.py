@@ -8,7 +8,7 @@ import threading
 import time
 import queue
 
-from hashing import HashVerifier, build_verifier
+from hashing import build_verifier, HashVerifier
 
 
 @dataclass
@@ -54,30 +54,23 @@ def _index_to_candidate(charset: str, length: int, idx: int) -> str:
     return _index_to_candidate_fixed(charset, length, idx)
 
 
-def _crack_subrange(
+def _worker_process(
     full_hash: str,
     charset: str,
     length: int,
-    sub_start: int,
-    sub_end: int,
-    stop_event: mp.synchronize.Event,
-    found_queue: mp.Queue,
-    total_tested,
-    current_index,
-    active_flag,
-    done_flag,
-    report_every: int = 250,
+    start_index: int,
+    end_index: int,
+    stop_event,
+    result_queue,
+    progress_queue,
+    report_every: int = 500,
 ) -> None:
     verifier = build_verifier(full_hash)
-
-    with active_flag.get_lock():
-        active_flag.value = 1
-
     local_tested = 0
-    last_report_index = sub_start
+    last_report_index = start_index
 
     try:
-        for idx in range(sub_start, sub_end):
+        for idx in range(start_index, end_index):
             if stop_event.is_set():
                 break
 
@@ -85,45 +78,29 @@ def _crack_subrange(
             local_tested += 1
 
             if verifier.verify(candidate):
-                with total_tested.get_lock():
-                    total_tested.value += local_tested
-                with current_index.get_lock():
-                    current_index.value = idx + 1
-
-                found_queue.put(candidate)
+                if local_tested > 0:
+                    progress_queue.put(("progress", local_tested, idx + 1))
+                result_queue.put(("found", candidate))
                 stop_event.set()
                 return
 
             if local_tested % report_every == 0:
-                with total_tested.get_lock():
-                    total_tested.value += report_every
-                with current_index.get_lock():
-                    current_index.value = idx + 1
+                progress_queue.put(("progress", report_every, idx + 1))
                 last_report_index = idx + 1
 
         remaining = local_tested % report_every
         if remaining:
-            with total_tested.get_lock():
-                total_tested.value += remaining
+            progress_queue.put(("progress", remaining, end_index))
 
-        with current_index.get_lock():
-            if stop_event.is_set():
-                # conservative resume point
-                current_index.value = max(current_index.value, last_report_index)
-            else:
-                current_index.value = sub_end
+        progress_queue.put(("done", 0, end_index))
 
-    finally:
-        with done_flag.get_lock():
-            done_flag.value = 1
-        with active_flag.get_lock():
-            active_flag.value = 0
+    except Exception as e:
+        progress_queue.put(("error", 0, f"{type(e).__name__}: {e}"))
 
 
 class ThreadedBruteForcer:
     """
-    Keeps the same external interface so worker.py does not need major changes,
-    but internally uses multiprocessing instead of threading for the actual cracking.
+    Same external API as before, but uses multiprocessing internally.
     """
 
     def __init__(
@@ -163,16 +140,17 @@ class ThreadedBruteForcer:
 
         self._ctx = mp.get_context("spawn")
         self._stop_event = self._ctx.Event()
-        self._found_queue: mp.Queue = self._ctx.Queue()
+        self._result_queue = self._ctx.Queue()
+        self._progress_queue = self._ctx.Queue()
 
-        self._total_tested = self._ctx.Value("Q", 0)
         self._processes: List[mp.Process] = []
 
-        self._current_indices = []
-        self._active_flags = []
-        self._done_flags = []
-
+        self._total_tested = 0
+        self._threads_active = 0
         self._found_password: Optional[str] = None
+
+        self._subranges: List[tuple[int, int]] = []
+        self._resume_positions: List[int] = []
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -198,43 +176,13 @@ class ThreadedBruteForcer:
 
         return ranges
 
-    def get_total_tested(self) -> int:
-        with self._total_tested.get_lock():
-            return int(self._total_tested.value)
-
-    def get_threads_active(self) -> int:
-        active = 0
-        for flag in self._active_flags:
-            with flag.get_lock():
-                active += int(flag.value)
-        return active
-
-    def get_resume_index(self) -> int:
-        if not self._current_indices:
-            return self._range_end
-
-        unfinished_positions: List[int] = []
-
-        for idx_value, done_flag in zip(self._current_indices, self._done_flags):
-            with done_flag.get_lock():
-                done = bool(done_flag.value)
-            if not done:
-                with idx_value.get_lock():
-                    unfinished_positions.append(int(idx_value.value))
-
-        if unfinished_positions:
-            return min(unfinished_positions)
-
-        return self._range_end
-
     def _start_processes(self) -> None:
-        for sub_start, sub_end in self._split_ranges():
-            current_index = self._ctx.Value("Q", sub_start)
-            active_flag = self._ctx.Value("b", 0)
-            done_flag = self._ctx.Value("b", 0)
+        self._subranges = self._split_ranges()
+        self._resume_positions = [start for start, _ in self._subranges]
 
-            proc = self._ctx.Process(
-                target=_crack_subrange,
+        for sub_start, sub_end in self._subranges:
+            p = self._ctx.Process(
+                target=_worker_process,
                 args=(
                     self.full_hash,
                     self.charset,
@@ -242,20 +190,48 @@ class ThreadedBruteForcer:
                     sub_start,
                     sub_end,
                     self._stop_event,
-                    self._found_queue,
-                    self._total_tested,
-                    current_index,
-                    active_flag,
-                    done_flag,
+                    self._result_queue,
+                    self._progress_queue,
                 ),
-                daemon=True,
             )
+            p.start()
+            self._processes.append(p)
 
-            self._current_indices.append(current_index)
-            self._active_flags.append(active_flag)
-            self._done_flags.append(done_flag)
-            self._processes.append(proc)
-            proc.start()
+        self._threads_active = len(self._processes)
+
+    def get_total_tested(self) -> int:
+        return self._total_tested
+
+    def get_threads_active(self) -> int:
+        return self._threads_active
+
+    def get_resume_index(self) -> int:
+        if not self._resume_positions:
+            return self._range_end
+        return min(self._resume_positions)
+
+    def _drain_progress(self) -> None:
+        while True:
+            try:
+                kind, amount, extra = self._progress_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if kind == "progress":
+                self._total_tested += int(amount)
+
+                resume_index = int(extra)
+                for i, (_start, end) in enumerate(self._subranges):
+                    if self._resume_positions[i] < end:
+                        self._resume_positions[i] = max(self._resume_positions[i], resume_index)
+                        break
+
+            elif kind == "done":
+                self._threads_active = max(0, self._threads_active - 1)
+
+            elif kind == "error":
+                self._threads_active = max(0, self._threads_active - 1)
+                print(f"[cracking.py child error] {extra}")
 
     def run(self) -> CrackResult:
         self._start_processes()
@@ -265,18 +241,21 @@ class ThreadedBruteForcer:
                 if self._external_stop is not None and self._external_stop.is_set():
                     self._stop_event.set()
 
+                self._drain_progress()
+
                 try:
-                    pw = self._found_queue.get(timeout=0.1)
-                    self._found_password = pw
-                    self._stop_event.set()
+                    kind, payload = self._result_queue.get(timeout=0.1)
+                    if kind == "found":
+                        self._found_password = payload
+                        self._stop_event.set()
                 except queue.Empty:
                     pass
 
                 if all(not p.is_alive() for p in self._processes):
+                    self._drain_progress()
                     break
 
                 if self._stop_event.is_set():
-                    # give children a moment to exit cleanly
                     time.sleep(0.05)
 
             for p in self._processes:
@@ -287,11 +266,10 @@ class ThreadedBruteForcer:
                     p.terminate()
                     p.join(timeout=0.5)
 
-            tried = self.get_total_tested()
             return CrackResult(
                 found=(self._found_password is not None),
                 password=self._found_password,
-                tried=tried,
+                tried=self._total_tested,
             )
 
         finally:
