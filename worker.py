@@ -426,8 +426,13 @@ class WorkerApp:
 
 def main() -> None:
     import multiprocessing as mp
+    import os
 
     mp.freeze_support()
+
+    print("RUNNING UPDATED worker.py")
+    print(f"cwd={os.getcwd()}")
+    print(f"file={__file__}")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", required=True, help="Controller host/IP")
