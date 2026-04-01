@@ -275,7 +275,18 @@ class WorkerApp:
 
     def run(self) -> int:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((self.controller_host, self.port))
+
+        try:
+            print(f"Connecting to {self.controller_host}:{self.port} ...")
+            sock.connect((self.controller_host, self.port))
+            print("Connected to controller.")
+        except Exception as e:
+            print(f"Connection failed: {type(e).__name__}: {e}")
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return 1
 
         try:
             self._safe_send(sock, RegisterMessage(worker_id=self.worker_id, threads=self.threads).to_dict())
