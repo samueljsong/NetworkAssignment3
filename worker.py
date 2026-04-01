@@ -271,15 +271,6 @@ class WorkerApp:
             remaining_count=actual_count,
         )
 
-        print(
-            f"[RESUME] worker={self.worker_id} "
-            f"chunk_id={assign.chunk_id} "
-            f"assigned_start={assign.start} "
-            f"assigned_count={assign.count} "
-            f"resume_index={actual_start} "
-            f"remaining_count={actual_count}"
-        )
-
         self._safe_send(sock, msg.to_dict())
 
     def run(self) -> int:
@@ -339,15 +330,6 @@ class WorkerApp:
                     actual_start, actual_count = self._maybe_resume_from_checkpoint(assign)
 
                     self._send_resume_notice(sock, assign, actual_start, actual_count)
-
-                    print(
-                        f"[ASSIGN] worker={self.worker_id} "
-                        f"chunk_id={assign.chunk_id} "
-                        f"assigned_start={assign.start} "
-                        f"assigned_count={assign.count} "
-                        f"actual_start={actual_start} "
-                        f"actual_count={actual_count}"
-                    )
 
                     with self._bruteforcer_lock:
                         self._current_chunk_id = assign.chunk_id
