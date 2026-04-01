@@ -18,7 +18,14 @@ from common import (
 )
 from cracking import ThreadedBruteForcer
 from hashing import build_verifier
-from messages import RegisterMessage, JobMessage, ChunkAssignMessage, ChunkDoneMessage, WorkerDoneMessage
+from messages import (
+    RegisterMessage,
+    JobMessage,
+    ChunkAssignMessage,
+    ChunkDoneMessage,
+    WorkerDoneMessage,
+    CheckpointResumeMessage,
+)
 
 
 class WorkerApp:
@@ -245,6 +252,36 @@ class WorkerApp:
         new_count = overlap_end - new_start
         return new_start, new_count
 
+    def _send_resume_notice(
+        self,
+        sock: socket.socket,
+        assign: ChunkAssignMessage,
+        actual_start: int,
+        actual_count: int,
+    ) -> None:
+        if actual_start <= assign.start:
+            return
+
+        msg = CheckpointResumeMessage(
+            worker_id=self.worker_id,
+            chunk_id=assign.chunk_id,
+            assigned_start=assign.start,
+            assigned_count=assign.count,
+            resume_index=actual_start,
+            remaining_count=actual_count,
+        )
+
+        print(
+            f"[RESUME] worker={self.worker_id} "
+            f"chunk_id={assign.chunk_id} "
+            f"assigned_start={assign.start} "
+            f"assigned_count={assign.count} "
+            f"resume_index={actual_start} "
+            f"remaining_count={actual_count}"
+        )
+
+        self._safe_send(sock, msg.to_dict())
+
     def run(self) -> int:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect((self.controller_host, self.port))
@@ -300,6 +337,17 @@ class WorkerApp:
                 if mtype == "CHUNK_ASSIGN":
                     assign = ChunkAssignMessage.from_dict(msg)
                     actual_start, actual_count = self._maybe_resume_from_checkpoint(assign)
+
+                    self._send_resume_notice(sock, assign, actual_start, actual_count)
+
+                    print(
+                        f"[ASSIGN] worker={self.worker_id} "
+                        f"chunk_id={assign.chunk_id} "
+                        f"assigned_start={assign.start} "
+                        f"assigned_count={assign.count} "
+                        f"actual_start={actual_start} "
+                        f"actual_count={actual_count}"
+                    )
 
                     with self._bruteforcer_lock:
                         self._current_chunk_id = assign.chunk_id

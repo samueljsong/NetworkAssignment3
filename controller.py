@@ -25,6 +25,7 @@ from messages import (
     ChunkDoneMessage,
     WorkerDoneMessage,
     ResultMessage,
+    CheckpointResumeMessage,
 )
 
 
@@ -318,6 +319,18 @@ class ControllerApp:
                         print(
                             f"[HB] {worker_id} delta={delta} total={total} "
                             f"active={int(msg.get('threads_active', 0))} chunk={chunk_id}"
+                        )
+                        continue
+                    
+                    if mtype == "CHECKPOINT_RESUME":
+                        resume_msg = CheckpointResumeMessage.from_dict(msg)
+                        print(
+                            f"[RESUME] worker={resume_msg.worker_id} "
+                            f"chunk_id={resume_msg.chunk_id} "
+                            f"assigned_start={resume_msg.assigned_start} "
+                            f"assigned_count={resume_msg.assigned_count} "
+                            f"resume_index={resume_msg.resume_index} "
+                            f"remaining_count={resume_msg.remaining_count}"
                         )
                         continue
 
