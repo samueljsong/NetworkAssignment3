@@ -22,13 +22,21 @@ from messages import RegisterMessage, JobMessage, ChunkAssignMessage, ChunkDoneM
 
 
 class WorkerApp:
-    def __init__(self, controller_host: str, port: int, threads: int, checkpoint_file: str) -> None:
+    def __init__(
+        self,
+        controller_host: str,
+        port: int,
+        threads: int,
+        checkpoint_file: str,
+        worker_id_file: str,
+    ) -> None:
         self.controller_host = controller_host
         self.port = port
         self.threads = threads
         self.checkpoint_file = checkpoint_file
+        self.worker_id_file = worker_id_file
 
-        self.worker_id = str(uuid.uuid4())
+        self.worker_id = self._load_or_create_worker_id()
 
         self._send_lock = threading.Lock()
         self._rx_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
@@ -46,6 +54,23 @@ class WorkerApp:
 
         self._job_signature: Optional[str] = None
         self._checkpoint_interval = 1000
+
+    def _load_or_create_worker_id(self) -> str:
+        if os.path.exists(self.worker_id_file):
+            try:
+                with open(self.worker_id_file, "r", encoding="utf-8") as f:
+                    saved = f.read().strip()
+                if saved:
+                    return saved
+            except Exception:
+                pass
+
+        new_id = str(uuid.uuid4())
+        tmp = self.worker_id_file + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(new_id)
+        os.replace(tmp, self.worker_id_file)
+        return new_id
 
     def _safe_send(self, sock: socket.socket, obj: dict) -> None:
         with self._send_lock:
@@ -199,6 +224,9 @@ class WorkerApp:
             return start, count
 
         if data.get("job_signature") != self._job_signature:
+            return start, count
+
+        if data.get("worker_id") != self.worker_id:
             return start, count
 
         saved_resume = int(data.get("resume_index", start))
@@ -361,9 +389,16 @@ def main() -> None:
     parser.add_argument("-p", type=int, required=True, help="Controller port")
     parser.add_argument("-t", type=int, required=True, help="Worker thread count")
     parser.add_argument("--checkpoint-file", default="worker_checkpoint.json", help="Local checkpoint file path")
+    parser.add_argument("--worker-id-file", default="worker_id.txt", help="Persistent worker ID file path")
     args = parser.parse_args()
 
-    app = WorkerApp(args.c, args.p, args.t, args.checkpoint_file)
+    app = WorkerApp(
+        args.c,
+        args.p,
+        args.t,
+        args.checkpoint_file,
+        args.worker_id_file,
+    )
     raise SystemExit(app.run())
 
 
