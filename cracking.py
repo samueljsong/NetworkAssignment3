@@ -28,8 +28,6 @@ class ThreadedBruteForcer:
         chunk_size: int = 2000,
         external_stop: Optional[threading.Event] = None,
     ) -> None:
-        if length <= 0:
-            raise ValueError("length must be > 0")
         if threads <= 0:
             raise ValueError("threads must be > 0")
         if not charset:
@@ -41,10 +39,12 @@ class ThreadedBruteForcer:
 
         self.verifier = verifier
         self.charset = charset
-        self.max_length = length
+
+        # length <= 0 means unbounded variable-length mode
+        self.length = length
+
         self.threads = threads
         self.chunk_size = max(1, chunk_size)
-
         self.base = len(charset)
 
         self._range_start = start_index
@@ -68,17 +68,6 @@ class ThreadedBruteForcer:
         self._inflight_lock = threading.Lock()
         self._inflight: Dict[int, int] = {}
 
-        # Precompute cumulative search-space boundaries for lengths 1..max_length
-        # Example for base=79, max_length=3:
-        # length 1 => indices [0, 79)
-        # length 2 => indices [79, 79+79^2)
-        # length 3 => indices [79+79^2, 79+79^2+79^3)
-        self._length_offsets: List[int] = [0]
-        running = 0
-        for candidate_len in range(1, self.max_length + 1):
-            running += self.base ** candidate_len
-            self._length_offsets.append(running)
-
     def stop(self) -> None:
         self._internal_stop.set()
 
@@ -90,24 +79,35 @@ class ThreadedBruteForcer:
         return False
 
     def _index_to_candidate(self, idx: int) -> str:
+        if idx < 0:
+            raise ValueError("idx must be >= 0")
+
         base = self.base
 
-        length = 1
-        count_for_length = base  # base^1
+        # Unbounded variable-length mode:
+        # indices cover length 1, then 2, then 3, and so on forever.
+        if self.length <= 0:
+            candidate_len = 1
+            bucket_size = base ** candidate_len
 
-        # Find which length bucket this index belongs to
-        while idx >= count_for_length:
-            idx -= count_for_length
-            length += 1
-            count_for_length = base ** length
+            while idx >= bucket_size:
+                idx -= bucket_size
+                candidate_len += 1
+                bucket_size = base ** candidate_len
 
-        # Convert remaining index into base-N string of that length
-        chars = []
-        for _ in range(length):
+            chars: List[str] = [""] * candidate_len
+            for pos in range(candidate_len - 1, -1, -1):
+                idx, digit = divmod(idx, base)
+                chars[pos] = self.charset[digit]
+
+            return "".join(chars)
+
+        # Fixed-length mode
+        chars: List[str] = [""] * self.length
+        for pos in range(self.length - 1, -1, -1):
             idx, digit = divmod(idx, base)
-            chars.append(self.charset[digit])
-
-        return "".join(reversed(chars))
+            chars[pos] = self.charset[digit]
+        return "".join(chars)
 
     def _claim_chunk(self) -> Optional[range]:
         with self._index_lock:
@@ -170,8 +170,10 @@ class ThreadedBruteForcer:
                     for idx in chunk:
                         if self._is_stopping():
                             break
+
                         candidate = self._index_to_candidate(idx)
                         local_tested += 1
+
                         if self.verifier.verify(candidate):
                             self._add_tested(local_tested)
                             self._set_found(candidate)
