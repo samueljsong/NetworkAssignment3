@@ -450,3 +450,6 @@ def main() -> None:
         args.worker_id_file,
     )
     raise SystemExit(app.run())
+
+if __name__ == "__main__":
+    main()
