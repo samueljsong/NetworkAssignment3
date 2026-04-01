@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Optional, List
+import multiprocessing as mp
 import threading
+import time
+import queue
 
-from hashing import HashVerifier
+from hashing import HashVerifier, build_verifier
 
 
 @dataclass
@@ -15,7 +18,114 @@ class CrackResult:
     tried: int
 
 
+def _index_to_candidate_fixed(charset: str, length: int, idx: int) -> str:
+    base = len(charset)
+    chars: List[str] = [""] * length
+    for pos in range(length - 1, -1, -1):
+        idx, digit = divmod(idx, base)
+        chars[pos] = charset[digit]
+    return "".join(chars)
+
+
+def _index_to_candidate_unbounded(charset: str, idx: int) -> str:
+    if idx < 0:
+        raise ValueError("idx must be >= 0")
+
+    base = len(charset)
+    candidate_len = 1
+    bucket_size = base ** candidate_len
+
+    while idx >= bucket_size:
+        idx -= bucket_size
+        candidate_len += 1
+        bucket_size = base ** candidate_len
+
+    chars: List[str] = [""] * candidate_len
+    for pos in range(candidate_len - 1, -1, -1):
+        idx, digit = divmod(idx, base)
+        chars[pos] = charset[digit]
+
+    return "".join(chars)
+
+
+def _index_to_candidate(charset: str, length: int, idx: int) -> str:
+    if length <= 0:
+        return _index_to_candidate_unbounded(charset, idx)
+    return _index_to_candidate_fixed(charset, length, idx)
+
+
+def _crack_subrange(
+    full_hash: str,
+    charset: str,
+    length: int,
+    sub_start: int,
+    sub_end: int,
+    stop_event: mp.synchronize.Event,
+    found_queue: mp.Queue,
+    total_tested,
+    current_index,
+    active_flag,
+    done_flag,
+    report_every: int = 250,
+) -> None:
+    verifier = build_verifier(full_hash)
+
+    with active_flag.get_lock():
+        active_flag.value = 1
+
+    local_tested = 0
+    last_report_index = sub_start
+
+    try:
+        for idx in range(sub_start, sub_end):
+            if stop_event.is_set():
+                break
+
+            candidate = _index_to_candidate(charset, length, idx)
+            local_tested += 1
+
+            if verifier.verify(candidate):
+                with total_tested.get_lock():
+                    total_tested.value += local_tested
+                with current_index.get_lock():
+                    current_index.value = idx + 1
+
+                found_queue.put(candidate)
+                stop_event.set()
+                return
+
+            if local_tested % report_every == 0:
+                with total_tested.get_lock():
+                    total_tested.value += report_every
+                with current_index.get_lock():
+                    current_index.value = idx + 1
+                last_report_index = idx + 1
+
+        remaining = local_tested % report_every
+        if remaining:
+            with total_tested.get_lock():
+                total_tested.value += remaining
+
+        with current_index.get_lock():
+            if stop_event.is_set():
+                # conservative resume point
+                current_index.value = max(current_index.value, last_report_index)
+            else:
+                current_index.value = sub_end
+
+    finally:
+        with done_flag.get_lock():
+            done_flag.value = 1
+        with active_flag.get_lock():
+            active_flag.value = 0
+
+
 class ThreadedBruteForcer:
+    """
+    Keeps the same external interface so worker.py does not need major changes,
+    but internally uses multiprocessing instead of threading for the actual cracking.
+    """
+
     def __init__(
         self,
         verifier: HashVerifier,
@@ -37,169 +147,156 @@ class ThreadedBruteForcer:
         if count < 0:
             raise ValueError("count must be >= 0")
 
-        self.verifier = verifier
+        full_hash = getattr(verifier, "full_hash", None)
+        if not isinstance(full_hash, str) or not full_hash:
+            raise ValueError("verifier must expose a non-empty full_hash string")
+
+        self.full_hash = full_hash
         self.charset = charset
-
-        # length <= 0 means unbounded variable-length mode
         self.length = length
-
         self.threads = threads
         self.chunk_size = max(1, chunk_size)
-        self.base = len(charset)
 
         self._range_start = start_index
         self._range_end = start_index + count
-
-        self._next_index = self._range_start
-        self._index_lock = threading.Lock()
-
-        self._internal_stop = threading.Event()
         self._external_stop = external_stop
 
-        self._found_lock = threading.Lock()
+        self._ctx = mp.get_context("spawn")
+        self._stop_event = self._ctx.Event()
+        self._found_queue: mp.Queue = self._ctx.Queue()
+
+        self._total_tested = self._ctx.Value("Q", 0)
+        self._processes: List[mp.Process] = []
+
+        self._current_indices = []
+        self._active_flags = []
+        self._done_flags = []
+
         self._found_password: Optional[str] = None
 
-        self._count_lock = threading.Lock()
-        self._total_tested = 0
-
-        self._threads_active = 0
-        self._threads_active_lock = threading.Lock()
-
-        self._inflight_lock = threading.Lock()
-        self._inflight: Dict[int, int] = {}
-
     def stop(self) -> None:
-        self._internal_stop.set()
+        self._stop_event.set()
 
-    def _is_stopping(self) -> bool:
-        if self._internal_stop.is_set():
-            return True
-        if self._external_stop is not None and self._external_stop.is_set():
-            return True
-        return False
+    def _split_ranges(self) -> List[tuple[int, int]]:
+        total = self._range_end - self._range_start
+        if total <= 0:
+            return []
 
-    def _index_to_candidate(self, idx: int) -> str:
-        if idx < 0:
-            raise ValueError("idx must be >= 0")
+        workers = min(self.threads, total)
+        base = total // workers
+        rem = total % workers
 
-        base = self.base
+        ranges: List[tuple[int, int]] = []
+        cursor = self._range_start
 
-        # Unbounded variable-length mode:
-        # indices cover length 1, then 2, then 3, and so on forever.
-        if self.length <= 0:
-            candidate_len = 1
-            bucket_size = base ** candidate_len
+        for i in range(workers):
+            size = base + (1 if i < rem else 0)
+            sub_start = cursor
+            sub_end = cursor + size
+            ranges.append((sub_start, sub_end))
+            cursor = sub_end
 
-            while idx >= bucket_size:
-                idx -= bucket_size
-                candidate_len += 1
-                bucket_size = base ** candidate_len
-
-            chars: List[str] = [""] * candidate_len
-            for pos in range(candidate_len - 1, -1, -1):
-                idx, digit = divmod(idx, base)
-                chars[pos] = self.charset[digit]
-
-            return "".join(chars)
-
-        # Fixed-length mode
-        chars: List[str] = [""] * self.length
-        for pos in range(self.length - 1, -1, -1):
-            idx, digit = divmod(idx, base)
-            chars[pos] = self.charset[digit]
-        return "".join(chars)
-
-    def _claim_chunk(self) -> Optional[range]:
-        with self._index_lock:
-            if self._next_index >= self._range_end:
-                return None
-            start = self._next_index
-            end = min(self._range_end, start + self.chunk_size)
-            self._next_index = end
-
-        with self._inflight_lock:
-            self._inflight[start] = end
-
-        return range(start, end)
-
-    def _mark_chunk_done(self, start: int) -> None:
-        with self._inflight_lock:
-            self._inflight.pop(start, None)
-
-    def _add_tested(self, n: int) -> None:
-        with self._count_lock:
-            self._total_tested += n
-
-    def _set_found(self, password: str) -> None:
-        with self._found_lock:
-            if self._found_password is None:
-                self._found_password = password
-                self._internal_stop.set()
+        return ranges
 
     def get_total_tested(self) -> int:
-        with self._count_lock:
-            return self._total_tested
+        with self._total_tested.get_lock():
+            return int(self._total_tested.value)
 
     def get_threads_active(self) -> int:
-        with self._threads_active_lock:
-            return self._threads_active
+        active = 0
+        for flag in self._active_flags:
+            with flag.get_lock():
+                active += int(flag.value)
+        return active
 
     def get_resume_index(self) -> int:
-        with self._index_lock:
-            next_index = self._next_index
-        with self._inflight_lock:
-            if not self._inflight:
-                return next_index
-            lowest_inflight = min(self._inflight.keys())
-        return min(next_index, lowest_inflight)
+        if not self._current_indices:
+            return self._range_end
 
-    def _worker_thread(self) -> None:
-        with self._threads_active_lock:
-            self._threads_active += 1
+        unfinished_positions: List[int] = []
 
-        try:
-            while not self._is_stopping():
-                chunk = self._claim_chunk()
-                if chunk is None:
-                    return
+        for idx_value, done_flag in zip(self._current_indices, self._done_flags):
+            with done_flag.get_lock():
+                done = bool(done_flag.value)
+            if not done:
+                with idx_value.get_lock():
+                    unfinished_positions.append(int(idx_value.value))
 
-                chunk_start = chunk.start
-                local_tested = 0
+        if unfinished_positions:
+            return min(unfinished_positions)
 
-                try:
-                    for idx in chunk:
-                        if self._is_stopping():
-                            break
+        return self._range_end
 
-                        candidate = self._index_to_candidate(idx)
-                        local_tested += 1
+    def _start_processes(self) -> None:
+        for sub_start, sub_end in self._split_ranges():
+            current_index = self._ctx.Value("Q", sub_start)
+            active_flag = self._ctx.Value("b", 0)
+            done_flag = self._ctx.Value("b", 0)
 
-                        if self.verifier.verify(candidate):
-                            self._add_tested(local_tested)
-                            self._set_found(candidate)
-                            return
+            proc = self._ctx.Process(
+                target=_crack_subrange,
+                args=(
+                    self.full_hash,
+                    self.charset,
+                    self.length,
+                    sub_start,
+                    sub_end,
+                    self._stop_event,
+                    self._found_queue,
+                    self._total_tested,
+                    current_index,
+                    active_flag,
+                    done_flag,
+                ),
+                daemon=True,
+            )
 
-                    if local_tested:
-                        self._add_tested(local_tested)
-                finally:
-                    self._mark_chunk_done(chunk_start)
-
-        finally:
-            with self._threads_active_lock:
-                self._threads_active -= 1
+            self._current_indices.append(current_index)
+            self._active_flags.append(active_flag)
+            self._done_flags.append(done_flag)
+            self._processes.append(proc)
+            proc.start()
 
     def run(self) -> CrackResult:
-        threads: List[threading.Thread] = []
-        for _ in range(self.threads):
-            t = threading.Thread(target=self._worker_thread, daemon=True)
-            threads.append(t)
-            t.start()
+        self._start_processes()
 
-        for t in threads:
-            t.join()
+        try:
+            while True:
+                if self._external_stop is not None and self._external_stop.is_set():
+                    self._stop_event.set()
 
-        tried = self.get_total_tested()
-        with self._found_lock:
-            pw = self._found_password
+                try:
+                    pw = self._found_queue.get(timeout=0.1)
+                    self._found_password = pw
+                    self._stop_event.set()
+                except queue.Empty:
+                    pass
 
-        return CrackResult(found=(pw is not None), password=pw, tried=tried)
+                if all(not p.is_alive() for p in self._processes):
+                    break
+
+                if self._stop_event.is_set():
+                    # give children a moment to exit cleanly
+                    time.sleep(0.05)
+
+            for p in self._processes:
+                p.join(timeout=1.0)
+
+            for p in self._processes:
+                if p.is_alive():
+                    p.terminate()
+                    p.join(timeout=0.5)
+
+            tried = self.get_total_tested()
+            return CrackResult(
+                found=(self._found_password is not None),
+                password=self._found_password,
+                tried=tried,
+            )
+
+        finally:
+            self._stop_event.set()
+            for p in self._processes:
+                if p.is_alive():
+                    p.terminate()
+                    p.join(timeout=0.5)

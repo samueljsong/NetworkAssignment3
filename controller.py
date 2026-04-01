@@ -6,7 +6,7 @@ import selectors
 import socket
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, Deque
 
 from common import (
@@ -64,13 +64,27 @@ class ShadowParser:
 
 
 @dataclass
+class Timings:
+    parse_time: float = 0.0
+    total_runtime: float = 0.0
+    dispatch_overhead: float = 0.0
+    checkpoint_overhead: float = 0.0
+    assignments_issued: int = 0
+    checkpoints_received: int = 0
+    heartbeats_received: int = 0
+    worker_runtimes: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
 class WorkerState:
     sock: socket.socket
     addr: Tuple[str, int]
     worker_id: str
     threads: int
     registered: bool = False
+    connected_at: float = 0.0
     last_seen: float = 0.0
+    total_tested: int = 0
     current_chunk: Optional[Tuple[int, int, int]] = None  # (chunk_id, start, count)
     current_resume_index: Optional[int] = None
 
@@ -121,7 +135,9 @@ class ControllerApp:
 
         self._workers: Dict[socket.socket, WorkerState] = {}
         self._sel = selectors.DefaultSelector()
-        self._found = False
+
+        self._found_password: Optional[str] = None
+        self._found_by: Optional[str] = None
         self._entry: Optional[ShadowEntry] = None
 
     def _broadcast(self, obj: dict) -> None:
@@ -138,20 +154,30 @@ class ControllerApp:
         except Exception:
             return False
 
+    def _requeue_current_chunk(self, ws: WorkerState, allocator: ChunkAllocator) -> None:
+        if ws.current_chunk is None:
+            return
+
+        chunk_id, start, count = ws.current_chunk
+        resume = ws.current_resume_index if ws.current_resume_index is not None else start
+        end = start + count
+        resume = max(start, min(resume, end))
+        remaining = end - resume
+
+        if remaining > 0:
+            allocator.requeue(chunk_id, resume, remaining)
+            print(
+                f"[RECOVER] requeued unfinished work from worker={ws.worker_id} "
+                f"chunk_id={chunk_id} start={resume} count={remaining}"
+            )
+
+        ws.current_chunk = None
+        ws.current_resume_index = None
+
     def _handle_disconnect(self, sock: socket.socket, allocator: ChunkAllocator) -> None:
         ws = self._workers.get(sock)
-        if ws and ws.current_chunk:
-            chunk_id, start, count = ws.current_chunk
-            resume = ws.current_resume_index if ws.current_resume_index is not None else start
-            resume = max(start, min(resume, start + count))
-            remaining = (start + count) - resume
-
-            if remaining > 0:
-                allocator.requeue(chunk_id, resume, remaining)
-                print(
-                    f"[RECOVER] requeued unfinished work from worker={ws.worker_id} "
-                    f"chunk_id={chunk_id} start={resume} count={remaining}"
-                )
+        if ws is not None:
+            self._requeue_current_chunk(ws, allocator)
 
         try:
             self._sel.unregister(sock)
@@ -176,8 +202,46 @@ class ControllerApp:
                 print(f"[TIMEOUT] worker {ws.worker_id} lost liveness")
                 self._handle_disconnect(sock, allocator)
 
+    @staticmethod
+    def _report(
+        entry: ShadowEntry,
+        timings: Timings,
+        *,
+        found: bool,
+        password: Optional[str],
+        found_by: Optional[str],
+    ) -> None:
+        print("\n=== JOB INFO ===")
+        print(f"Username:  {entry.username}")
+        print(f"Algorithm: {entry.algo_name}")
+
+        print("\n=== RESULTS ===")
+        print(f"Password found: {found}")
+        if found:
+            print(f"Password:       {password}")
+            print(f"Found by:       {found_by}")
+
+        print("\n=== TIMING (seconds) ===")
+        print(f"Parse time:         {timings.parse_time:.6f}")
+        print(f"Dispatch overhead:  {timings.dispatch_overhead:.6f}")
+        print(f"Checkpoint overhead: {timings.checkpoint_overhead:.6f}")
+        print(f"Total runtime:      {timings.total_runtime:.6f}")
+        print(f"Assignments issued: {timings.assignments_issued}")
+        print(f"Checkpoints recv:   {timings.checkpoints_received}")
+        print(f"Heartbeats recv:    {timings.heartbeats_received}")
+
+        if timings.worker_runtimes:
+            print("\n=== WORKER RUNTIMES ===")
+            for worker_id, runtime in timings.worker_runtimes.items():
+                print(f"{worker_id}: {runtime:.6f}")
+
     def run(self) -> int:
+        t0 = time.perf_counter()
+        timings = Timings()
+
+        t_parse0 = time.perf_counter()
         self._entry = ShadowParser.parse_shadow_file(self.shadow_file, self.username)
+        timings.parse_time = time.perf_counter() - t_parse0
 
         charset = supported_charset_79()
         allocator = ChunkAllocator(self.chunk_size)
@@ -190,7 +254,7 @@ class ControllerApp:
 
         self._sel.register(server, selectors.EVENT_READ, data="ACCEPT")
 
-        print(f"Controller running (UNBOUNDED SEARCH)")
+        print("Controller running (UNBOUNDED SEARCH)")
         print(f"Target user: {self._entry.username}  Algo: {self._entry.algo_name}")
         print(f"heartbeat={self.heartbeat_seconds}s chunk_size={self.chunk_size} checkpoint={self.checkpoint_interval}")
 
@@ -222,6 +286,7 @@ class ControllerApp:
                             worker_id="",
                             threads=0,
                             registered=False,
+                            connected_at=time.time(),
                             last_seen=time.time(),
                         )
                         print(f"Worker connected {addr}")
@@ -247,6 +312,7 @@ class ControllerApp:
                         ws.threads = reg.threads
                         ws.registered = True
 
+                        t_dispatch0 = time.perf_counter()
                         job = JobMessage(
                             full_hash=self._entry.full_hash,
                             length=0,
@@ -255,18 +321,25 @@ class ControllerApp:
                             heartbeat_seconds=self.heartbeat_seconds,
                             checkpoint_interval=self.checkpoint_interval,
                         )
-                        MessageIO.send_msg(sock, job.to_dict())
+                        ok = self._safe_send(sock, job.to_dict())
+                        timings.dispatch_overhead += (time.perf_counter() - t_dispatch0)
+
+                        if not ok:
+                            self._handle_disconnect(sock, allocator)
+                            continue
+
                         print(f"Registered worker_id={ws.worker_id} threads={ws.threads} from {ws.addr}")
                         continue
 
                     if mtype == "WORK_REQUEST":
-                        if self._found:
-                            MessageIO.send_msg(sock, stop_dict("FOUND"))
+                        if self._found_password is not None:
+                            self._safe_send(sock, stop_dict("FOUND"))
                             continue
 
                         assign = allocator.claim()
                         ws.current_chunk = (assign.chunk_id, assign.start, assign.count)
                         ws.current_resume_index = assign.start
+                        timings.assignments_issued += 1
 
                         print(
                             f"[ASSIGN] worker={ws.worker_id} "
@@ -275,15 +348,22 @@ class ControllerApp:
                             f"count={assign.count}"
                         )
 
-                        MessageIO.send_msg(sock, assign.to_dict())
+                        if not self._safe_send(sock, assign.to_dict()):
+                            self._handle_disconnect(sock, allocator)
                         continue
 
                     if mtype == "CHECKPOINT":
+                        t_ckpt0 = time.perf_counter()
+
+                        timings.checkpoints_received += 1
+
                         if ws.current_chunk is not None:
                             chunk_id, start, count = ws.current_chunk
                             resume = int(msg.get("resume_index", start))
                             resume = max(start, min(resume, start + count))
                             ws.current_resume_index = resume
+
+                        timings.checkpoint_overhead += (time.perf_counter() - t_ckpt0)
 
                         print(
                             f"[CKPT] worker={ws.worker_id} "
@@ -305,6 +385,10 @@ class ControllerApp:
                         continue
 
                     if mtype == "HEARTBEAT_RESP":
+                        timings.heartbeats_received += 1
+
+                        ws.total_tested = int(msg.get("total_tested", ws.total_tested))
+
                         print(
                             f"[HB] {msg.get('worker_id')} "
                             f"delta={msg.get('delta_tested')} "
@@ -324,15 +408,25 @@ class ControllerApp:
                                 ws.current_resume_index = None
 
                         if done.found and done.password:
+                            self._found_password = done.password
+                            self._found_by = ws.worker_id
                             print(f"PASSWORD FOUND by {ws.worker_id}: {done.password}")
-                            self._found = True
                             self._broadcast(stop_dict("FOUND"))
+                            timings.total_runtime = time.perf_counter() - t0
+                            self._report(
+                                self._entry,
+                                timings,
+                                found=True,
+                                password=done.password,
+                                found_by=ws.worker_id,
+                            )
                             return 0
 
                         continue
 
                     if mtype == "WORKER_DONE":
                         wd = WorkerDoneMessage.from_dict(msg)
+                        timings.worker_runtimes[wd.worker_id] = wd.runtime_sec
                         print(
                             f"[WORKER_DONE] worker={wd.worker_id} "
                             f"runtime={wd.runtime_sec:.4f}s "
@@ -344,13 +438,32 @@ class ControllerApp:
                     if mtype == "RESULT":
                         res = ResultMessage.from_dict(msg)
                         if res.found and res.password:
+                            self._found_password = res.password
+                            self._found_by = ws.worker_id
                             print(f"PASSWORD FOUND: {res.password}")
-                            self._found = True
                             self._broadcast(stop_dict("FOUND"))
+                            timings.total_runtime = time.perf_counter() - t0
+                            self._report(
+                                self._entry,
+                                timings,
+                                found=True,
+                                password=res.password,
+                                found_by=ws.worker_id,
+                            )
                             return 0
                         continue
 
         finally:
+            if self._found_password is None and self._entry is not None:
+                timings.total_runtime = time.perf_counter() - t0
+                self._report(
+                    self._entry,
+                    timings,
+                    found=False,
+                    password=None,
+                    found_by=None,
+                )
+
             try:
                 self._sel.close()
             except Exception:

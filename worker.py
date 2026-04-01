@@ -414,6 +414,10 @@ class WorkerApp:
 
 
 def main() -> None:
+    import multiprocessing as mp
+
+    mp.freeze_support()
+
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", required=True, help="Controller host/IP")
     parser.add_argument("-p", type=int, required=True, help="Controller port")
@@ -430,7 +434,3 @@ def main() -> None:
         args.worker_id_file,
     )
     raise SystemExit(app.run())
-
-
-if __name__ == "__main__":
-    main()
